@@ -84,20 +84,128 @@ const intersectClips = (outer: Clip | undefined, inner: Clip): Clip => {
 	};
 };
 
+// Count rows without tokenizing text that may be outside the viewport.
+const countLines = (text: string): number => {
+	let count = 1;
+	for (
+		let index = text.indexOf('\n');
+		index !== -1;
+		index = text.indexOf('\n', index + 1)
+	) {
+		count++;
+	}
+
+	return count;
+};
+
+type SizedEntry<Value> = {value: Value; size: number};
+
+/**
+ * Cache based on size rather than just count.
+ * Behaves like quick-lru (two generations) but this keeps memory usage stable. 
+ */
+class SizedCache<Value> {
+	private current = new Map<string, SizedEntry<Value>>();
+	private previous = new Map<string, SizedEntry<Value>>();
+	private currentSize = 0;
+	private readonly maxSize: number;
+
+	constructor(maxSize: number) {
+		this.maxSize = maxSize;
+	}
+
+	private add(key: string, entry: SizedEntry<Value>): void {
+		this.current.set(key, entry);
+		this.currentSize += entry.size;
+		if (this.currentSize < this.maxSize / 2) {
+			return;
+		}
+
+		this.previous = this.current;
+		this.current = new Map();
+		this.currentSize = 0;
+	}
+
+	get(key: string): Value | undefined {
+		const entry = this.current.get(key);
+		if (entry !== undefined) {
+			return entry.value;
+		}
+
+		const old = this.previous.get(key);
+		if (old === undefined) {
+			return undefined;
+		}
+
+		this.previous.delete(key);
+		this.add(key, old);
+		return old.value;
+	}
+
+	set(key: string, value: Value, size: number): void {
+		// Don't let one large entry drop everything else.
+		if (size > this.maxSize / 8) {
+			return;
+		}
+
+		this.previous.delete(key);
+		const existing = this.current.get(key);
+		if (existing !== undefined) {
+			this.currentSize -= existing.size;
+		}
+
+		this.add(key, {value, size});
+	}
+}
+
+// Prevent style chars from taking up a cell.
+const parseStyledChars = (text: string): StyledChar[] =>
+	styledCharsFromTokens(tokenize(text)).filter(
+		character => !/^\p{Default_Ignorable_Code_Point}+$/u.test(character.value),
+	);
+
 class OutputCaches {
-	widths = new Map<string, number>();
-	blockWidths = new Map<string, number>();
-	styledChars = new Map<string, StyledChar[]>();
+	// Sized by UTF-16 code units.
+	// Styled characters are much larger than their text, so only single lines are kept.
+
+	widths = new SizedCache<number>(2 ** 18);
+	blockWidths = new SizedCache<number>(2 ** 20);
+
+	// **16 keeps memory close to baseline while still getting good hits..  
+	styledChars = new SizedCache<StyledChar[]>(2 ** 16);
+	lines = new SizedCache<string[]>(2 ** 20);
+
+	getLines(text: string): string[] {
+		let cached = this.lines.get(text);
+		if (cached === undefined) {
+			// Carry styles across newlines, but only keep the first.
+			const characters = text.includes('\n')
+				? parseStyledChars(text)
+				: this.getStyledChars(text);
+			const characterLines: StyledChar[][] = [[]];
+			for (const character of characters) {
+				if (character.value === '\n') {
+					characterLines.push([]);
+				} else {
+					characterLines.at(-1)!.push(character);
+				}
+			}
+
+			cached = characterLines.map(line => styledCharsToString(line));
+			// Key plus lines of the ~same length.
+			this.lines.set(text, cached, text.length * 2);
+		}
+
+		return cached;
+	}
 
 	getStyledChars(line: string): StyledChar[] {
 		let cached = this.styledChars.get(line);
 		if (cached === undefined) {
-			// Standalone invisible Unicode characters must not occupy terminal cells.
-			cached = styledCharsFromTokens(tokenize(line)).filter(
-				character =>
-					!/^\p{Default_Ignorable_Code_Point}+$/u.test(character.value),
-			);
-			this.styledChars.set(line, cached);
+			cached = parseStyledChars(line);
+			if (!line.includes('\n')) {
+				this.styledChars.set(line, cached, line.length);
+			}
 		}
 
 		return cached;
@@ -107,7 +215,7 @@ class OutputCaches {
 		let cached = this.widths.get(text);
 		if (cached === undefined) {
 			cached = stringWidth(text);
-			this.widths.set(text, cached);
+			this.widths.set(text, cached, text.length);
 		}
 
 		return cached;
@@ -116,22 +224,27 @@ class OutputCaches {
 	getWidestLine(text: string): number {
 		let cached = this.blockWidths.get(text);
 		if (cached === undefined) {
+			// Don't cache split lines so we don't keep the entire block alive.
 			let lineWidth = 0;
 			for (const line of text.split('\n')) {
-				lineWidth = Math.max(lineWidth, this.getStringWidth(line));
+				lineWidth = Math.max(lineWidth, stringWidth(line));
 			}
 
 			cached = lineWidth;
-			this.blockWidths.set(text, cached);
+			this.blockWidths.set(text, cached, text.length);
 		}
 
 		return cached;
 	}
 }
 
+// Each frame creates an Output, but most of its text is unchanged. Keep these
+// text-only caches across frames and bound them to avoid retaining every write.
+const sharedCaches = new OutputCaches();
+
 export default class Output {
 	private readonly operations: Operation[] = [];
-	private readonly caches: OutputCaches = new OutputCaches();
+	private readonly caches: OutputCaches = sharedCaches;
 
 	width: number;
 	height: number;
@@ -150,24 +263,23 @@ export default class Output {
 	): void {
 		const {text, transformers} = operation;
 		let {x, y} = operation;
-		// Preserve styles across explicit newlines before clipping individual rows.
-		const characterLines: StyledChar[][] = [[]];
-		for (const character of this.caches.getStyledChars(text)) {
-			if (character.value === '\n') {
-				characterLines.push([]);
-			} else {
-				characterLines.at(-1)!.push(character);
-			}
+		const lineCount = countLines(text);
+		if (
+			y + lineCount <= 0 ||
+			y >= output.length ||
+			(clip &&
+				(isClipEmpty(clip) ||
+					(typeof clip.y1 === 'number' &&
+						typeof clip.y2 === 'number' &&
+						(y + lineCount <= clip.y1 || y >= clip.y2))))
+		) {
+			return;
 		}
 
-		let lines = characterLines.map(line => styledCharsToString(line));
+		// Preserve styles across explicit newlines before clipping individual rows.
+		let lines = this.caches.getLines(text);
 
 		if (clip) {
-			// Two nested clips can intersect to nothing. Nothing is visible, so bail out before slicing.
-			if (isClipEmpty(clip)) {
-				return;
-			}
-
 			const shouldClipHorizontally =
 				typeof clip?.x1 === 'number' && typeof clip?.x2 === 'number';
 
@@ -180,14 +292,6 @@ export default class Output {
 				const width = this.caches.getWidestLine(text);
 
 				if (x + width < clip.x1! || x > clip.x2!) {
-					return;
-				}
-			}
-
-			if (shouldClipVertically) {
-				const height = lines.length;
-
-				if (y + height < clip.y1! || y > clip.y2!) {
 					return;
 				}
 			}
